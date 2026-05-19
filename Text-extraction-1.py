@@ -17,11 +17,14 @@ import torch
 # -------- Surya OCR --------
 from surya.models import load_predictors
 
-# -------- LangChain --------
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_community.vectorstores import Chroma
-from langchain_core.documents import Document
+# -------- LlamaIndex --------
+from llama_index.core import VectorStoreIndex, Document
+from llama_index.core.node_parser import SentenceSplitter
+from llama_index.embeddings.huggingface import HuggingFaceEmbedding
+from llama_index.vector_stores.chroma import ChromaVectorStore
+from llama_index.core.storage.storage_context import StorageContext
+
+import chromadb
 
 # -------- CONFIG --------
 OLLAMA_BASE_URL = "http://localhost:8890/v1"
@@ -29,7 +32,8 @@ OLLAMA_MODEL = "meta/llama-3.1-8b-instruct"
 OLLAMA_API_KEY = os.getenv("OLLAMA_API_KEY")
 
 st.set_page_config(page_title="Chat with PDF/Image", layout="wide")
-st.title("💬 Chat with PDF or Image (Surya OCR + Ollama)")
+st.title("💬 Intelligent Document Extraction")
+st.title("TCS NVIDIA Capability Centre.... Welcome!")
 
 # -------- SESSION STATE --------
 st.session_state.setdefault("vectorstore", None)
@@ -97,7 +101,7 @@ def ask_llama(prompt: str):
 You are a multilingual assistant.
 Answer ONLY using the provided context.
 Support English, Hindi, and Arabic.
-Return the answer in the same language as the question.
+Return the answer in English if user didn't mention any language like hindi or arabic language in the question asked.
 """
             },
             {"role": "user", "content": prompt}
@@ -130,7 +134,6 @@ def pdf_to_images(pdf_path: str, dpi: int = 300) -> List[Image.Image]:
 
             img_np = np.array(img)
 
-            # -------- Arabic-friendly preprocessing --------
             gray = cv2.cvtColor(img_np, cv2.COLOR_BGR2GRAY)
 
             denoise = cv2.fastNlMeansDenoising(gray, None, 10, 7, 21)
@@ -169,12 +172,12 @@ def surya_ocr(images):
 @st.cache_resource
 def build_vectorstore(text_pages, persist_dir):
 
-    splitter = RecursiveCharacterTextSplitter(
+    splitter = SentenceSplitter(
         chunk_size=1500,
         chunk_overlap=300
     )
 
-    docs = []
+    documents = []
 
     for page_num, page_text in enumerate(text_pages, start=1):
 
@@ -182,40 +185,48 @@ def build_vectorstore(text_pages, persist_dir):
 
         for chunk in chunks:
 
-            docs.append(
+            documents.append(
                 Document(
-                    page_content=chunk,
+                    text=chunk,
                     metadata={"page": page_num}
                 )
             )
 
-    embeddings = HuggingFaceEmbeddings(
-    model_name="BAAI/bge-m3",
-    model_kwargs={
-        "device": DEVICE,
-        "trust_remote_code": True
-    },
-    encode_kwargs={
-        "normalize_embeddings": True,
-        "batch_size": 32
-    }
-)
-
-    vectorstore = Chroma.from_documents(
-        documents=docs,
-        embedding=embeddings,
-        persist_directory=persist_dir
+    embed_model = HuggingFaceEmbedding(
+        model_name="sentence-transformers/paraphrase-multilingual-mpnet-base-v2",
+        device=DEVICE
     )
 
-    return vectorstore
+    client = chromadb.PersistentClient(path=persist_dir)
+
+    collection = client.get_or_create_collection("doc_collection")
+
+    vector_store = ChromaVectorStore(chroma_collection=collection)
+
+    storage_context = StorageContext.from_defaults(vector_store=vector_store)
+
+    index = VectorStoreIndex.from_documents(
+        documents,
+        storage_context=storage_context,
+        embed_model=embed_model
+    )
+
+    return index
 
 # -------- QUERY DOCUMENT --------
 def query_document(question):
 
-    docs = st.session_state.vectorstore.similarity_search(question, k=4)
+    retriever = st.session_state.vectorstore.as_retriever(
+        similarity_top_k=4
+    )
+
+    nodes = retriever.retrieve(question)
 
     context = "\n\n".join(
-        [f"(Page {d.metadata.get('page')}) {d.page_content}" for d in docs]
+        [
+            f"(Page {n.metadata.get('page')}) {n.text}"
+            for n in nodes
+        ]
     )
 
     prompt = f"""
@@ -225,8 +236,7 @@ Context:
 Question:
 {question}
 
-Answer aqurately using ONLY the context and the language in which question was asked, cite the page numbers.
-
+Answer accurately using ONLY the context and cite page numbers.
 """
 
     return ask_llama(prompt)
